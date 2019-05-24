@@ -35,5 +35,5 @@ CMD pcwprofiler \
 	-dsn "${MYSQL_USER}:${MYSQL_PASSWORD}@(db)/${MYSQL_DATABASE}" \
 	-profiler /apps/profiler \
 	-language-dir /language-data \
-	-project-dir /project-data \
+	-project-dir / \
     -debug

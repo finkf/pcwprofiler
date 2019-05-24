@@ -29,17 +29,21 @@ var (
 	profiler    = "/apps/profiler"
 	dsn         = ""
 	debug       = false
+	cutoff      = 1e-4
 )
 
 func init() {
 	flag.StringVar(&listen, "listen", listen, "set host")
-	flag.StringVar(&projectDir, "project-dir", projectDir, "set project base dir")
+	flag.StringVar(&projectDir, "project-dir",
+		projectDir, "set project base dir")
 	flag.StringVar(&languageDir, "language-dir",
 		languageDir, "set profiler's language backend")
 	flag.StringVar(&profiler, "profiler",
 		profiler, "path to profiler executable")
 	flag.StringVar(&dsn, "dsn", dsn,
 		"set mysql connection DSN (user:pass@proto(host)/dbname)")
+	flag.Float64Var(&cutoff, "cutoff",
+		cutoff, "set cutoff weight for profiler suggestions")
 	flag.BoolVar(&debug, "debug", debug, "enable debugging")
 }
 
@@ -62,12 +66,20 @@ func main() {
 		service.WithLog(service.WithMethods(http.MethodGet, getLanguages())))
 	http.HandleFunc("/profile/books/",
 		service.WithLog(service.WithMethods(
-			http.MethodGet, service.WithProject(getProfile()))))
-	http.HandleFunc("/profile/jobs/books/",
-		service.WithLog(service.WithMethods(
-			http.MethodGet, service.WithProject(run()))))
+			http.MethodGet, service.WithProject(getProfile()),
+			http.MethodPost, service.WithProject(run()))))
 	http.HandleFunc("/profile/jobs/",
-		service.WithLog(service.WithMethods(http.MethodGet, status())))
+		service.WithLog(
+			service.WithMethods(http.MethodGet, status())))
+	http.HandleFunc("/profile/patterns/books/",
+		service.WithLog(service.WithMethods(
+			http.MethodGet, service.WithProject(getPatterns()))))
+	http.HandleFunc("/profile/suspicious/books/",
+		service.WithLog(service.WithMethods(
+			http.MethodGet, service.WithProject(getSuspiciousWords()))))
+	http.HandleFunc("/profile/adaptive/books/",
+		service.WithLog(service.WithMethods(
+			http.MethodGet, service.WithProject(getAdaptiveTokens()))))
 	log.Infof("listening on %s", listen)
 	log.Fatal(http.ListenAndServe(listen, nil))
 }
@@ -89,7 +101,7 @@ func getLanguages() service.HandlerFunc {
 }
 
 func status() service.HandlerFunc {
-	re := regexp.MustCompile(`/jobs/(\d+)$`)
+	re := regexp.MustCompile(`/jobs/(\d+)`)
 	return func(w http.ResponseWriter, r *http.Request, d *service.Data) {
 		var jobID int
 		if err := service.ParseIDs(r.URL.String(), re, &jobID); err != nil {
@@ -114,54 +126,47 @@ func getProfile() service.HandlerFunc {
 func getWholeProfile(w http.ResponseWriter, r *http.Request, p *db.Project) {
 	w.Header().Add("Content-Encoding", "gzip")
 	w.Header().Add("Content-Type", "application/json")
-	http.ServeFile(w, r, filepath.Join(p.Directory, "profile.json.gz"))
+	http.ServeFile(w, r, filepath.Join(projectDir, p.Directory, "profile.json.gz"))
 }
 
 func queryProfile(w http.ResponseWriter, p *db.Project, qs []string) {
-	// return the suggestion for the given query terms
-	const stmt = "SELECT id FROM types WHERE typ=?"
-	suggestions := api.Suggestions{BookID: p.BookID}
+	ss := api.Suggestions{
+		BookID:      p.BookID,
+		Suggestions: make(map[string][]api.Suggestion),
+	}
 	for _, q := range qs {
 		ql := strings.ToLower(q)
-		rows, err := db.Query(service.Pool(), stmt, ql)
-		if err != nil {
+		if err := selectSuggestions(ql, &ss); err != nil {
 			service.ErrorResponse(w, http.StatusInternalServerError,
 				"cannot get suggestions: %v", err)
 			return
 		}
-		defer rows.Close()
-		for rows.Next() {
-			var qid int
-			if err := rows.Scan(&qid); err != nil {
-				service.ErrorResponse(w, http.StatusInternalServerError,
-					"cannot get suggestions: %v", err)
-				return
-			}
-			if err := selectSuggestions(q, p.BookID, qid, &suggestions); err != nil {
-				service.ErrorResponse(w, http.StatusInternalServerError,
-					"cannot get suggestions: %v", err)
-				return
-			}
-		}
 	}
-	service.JSONResponse(w, suggestions)
+	service.JSONResponse(w, ss)
 }
 
-func selectSuggestions(q string, bid, qid int, suggs *api.Suggestions) error {
-	const stmt = "SELECT s.Weight,s.Distance,s.TopSuggestion,t.Typ FROM suggestions s " +
-		"JOIN types t ON s.suggestiontypid=t.id WHERE s.BookID=? AND s.TypID=?"
-	rows, err := db.Query(service.Pool(), stmt, bid, qid)
+func selectSuggestions(q string, ss *api.Suggestions) error {
+	const stmt = "SELECT s.id,s.weight,s.distance,s.dict," +
+		"s.topsuggestion,t1.typ,t2.typ,t3.typ " +
+		"FROM suggestions s " +
+		"JOIN types t1 ON s.tokentypid=t1.id " +
+		"JOIN types t2 ON s.suggestiontypid=t2.id " +
+		"JOIN types t3 ON s.moderntypid=t3.id " +
+		"WHERE s.bookid=? AND t1.typ=?"
+	rows, err := db.Query(service.Pool(), stmt, ss.BookID, q)
 	if err != nil {
 		return err
 	}
 	defer rows.Close()
 	for rows.Next() {
-		s := api.Suggestion{Token: q}
-		if err := rows.Scan(&s.Weight, &s.Distance, &s.Top, &s.Suggestion); err != nil {
+		var s api.Suggestion
+		if err := rows.Scan(&s.ID, &s.Weight, &s.Distance, &s.Dict, &s.Top,
+			&s.Token, &s.Suggestion, &s.Modern); err != nil {
 			return err
 		}
 		s.Suggestion = sameCasing(q, s.Suggestion)
-		suggs.Suggestions = append(suggs.Suggestions, s)
+		s.Modern = sameCasing(q, s.Modern)
+		ss.Suggestions[q] = append(ss.Suggestions[q], s)
 	}
 	return nil
 }
@@ -203,26 +208,28 @@ func runProfiler(w http.ResponseWriter, r *http.Request, d *service.Data) {
 	jobID, err := jobs.Start(context.Background(), d.Project.BookID, func(ctx context.Context) error {
 		var tokens []gofiler.Token
 		err := eachLine(d.Project.BookID, func(line db.Chars) error {
-			for _, token := range tokenize(line) {
-				tokens = append(tokens, gofiler.Token{
-					COR: token.Cor(),
-					OCR: token.OCR(),
-				})
-			}
-			return nil
+			return eachWord(line, func(word db.Chars) error {
+				tokens = append(tokens, gofiler.Token{OCR: word.OCR()})
+				if word.IsFullyCorrected() {
+					tokens[len(tokens)-1].COR = word.Cor()
+				}
+				return nil
+			})
 		})
 		if err != nil {
 			return fmt.Errorf("cannot profile: %v", err)
 		}
 		log.Debugf("profiling %d tokens", len(tokens))
-		profile, err := gofiler.Run(ctx, profiler, config.Path, tokens, logger{})
+		tmp, err := gofiler.Run(ctx, profiler, config.Path, tokens, logger{})
 		if err != nil {
 			return fmt.Errorf("cannot profile: %v", err)
 		}
+		profile := api.Profile{Profile: tmp, BookID: d.Project.BookID}
+
 		if err := saveProfile(d.Project, profile); err != nil {
 			return fmt.Errorf("cannot profile: %v", err)
 		}
-		if err := insertProfileIntoDB(profile, d.Project.BookID); err != nil {
+		if err := insertProfileIntoDB(profile); err != nil {
 			return fmt.Errorf("cannot profile: %v", err)
 		}
 		return nil
@@ -237,7 +244,7 @@ func runProfiler(w http.ResponseWriter, r *http.Request, d *service.Data) {
 	}{jobID})
 }
 
-func saveProfile(p *db.Project, profile gofiler.Profile) (err error) {
+func saveProfile(p *db.Project, profile api.Profile) (err error) {
 	dest := filepath.Join(projectDir, p.Directory, "profile.json.gz")
 	out, err := os.Create(dest)
 	if err != nil {
@@ -260,49 +267,96 @@ func saveProfile(p *db.Project, profile gofiler.Profile) (err error) {
 	return nil
 }
 
-func insertProfileIntoDB(profile gofiler.Profile, bookID int) error {
+func insertProfileIntoDB(profile api.Profile) error {
 	t := db.NewTransaction(service.Pool().Begin())
-	const stmt = "INSERT INTO suggestions " +
-		"(BookID,PageID,LineID,TokenID,TypID,SuggestionTypID,Weight,Distance,TopSuggestion) " +
-		"VALUES (?,?,?,?,?,?,?,?,?)"
 	t.Do(func(dtb db.DB) error {
-		for _, interp := range profile {
+		stmnt := "DELETE FROM suggestions WHERE bookid=?"
+		if _, err := db.Exec(service.Pool(), stmnt, profile.BookID); err != nil {
+			return fmt.Errorf("cannot insert profile: %v", err)
+		}
+		stmnt = "DELETE FROM errorpatterns WHERE bookid=?"
+		if _, err := db.Exec(service.Pool(), stmnt, profile.BookID); err != nil {
+			return fmt.Errorf("cannot insert profile: %v", err)
+		}
+		types := make(map[string]int)
+		for _, interp := range profile.Profile {
 			if len(interp.Candidates) == 0 {
 				continue
 			}
-			oid, err := db.NewType(dtb, interp.OCR, nil)
+			tid, err := db.NewType(dtb, interp.OCR, types)
 			if err != nil {
 				return fmt.Errorf("cannot insert profile: %v", err)
 			}
 			for i, cand := range interp.Candidates {
-				if cand.Distance == 0 { // skip if no OCR error
+				// skip if no OCR error or if weight too low
+				if cand.Distance == 0 || float64(cand.Weight) <= cutoff {
 					continue
 				}
-				sid, err := db.NewType(dtb, cand.Suggestion, nil)
-				if err != nil {
-					return fmt.Errorf("cannot insert profile: %v", err)
-				}
-				res, err := dtb.Exec(stmt, bookID, 1, 1, 1, oid, sid, cand.Weight, cand.Distance, i == 0)
-				if err != nil {
-					return fmt.Errorf("cannot insert profile: %v", err)
-				}
-				suggID, err := res.LastInsertId()
-				if err := insertPatternsIntoDB(
-					dtb, cand.OCRPatterns, bookID, int(suggID), false); err != nil {
+				if err := insertCandidate(dtb, cand, profile.BookID,
+					tid, types, i == 0); err != nil {
 					return fmt.Errorf("cannot insert profile: %v", err)
 				}
 			}
+		}
+		stmnt = "UPDATE books SET statusid=? WHERE bookid=? AND statusid<?"
+		status := db.StatusIDProfiled
+		if _, err := db.Exec(service.Pool(), stmnt, status, profile.BookID, status); err != nil {
+			return fmt.Errorf("cannot insert profile: %v", err)
 		}
 		return nil
 	})
 	return t.Done()
 }
 
-func insertPatternsIntoDB(dtb db.DB, ps []gofiler.Pattern, bookID, suggID int, ocr bool) error {
-	const stmt = "INSERT INTO errorpatterns (suggestionID,bookID,pattern,ocr) VALUES (?,?,?,?)"
+func insertCandidate(
+	dtb db.DB,
+	cand gofiler.Candidate,
+	bid, tid int,
+	ids map[string]int,
+	top bool,
+) error {
+	stmt := fmt.Sprintf("INSERT INTO %s (%s,%s,%s,%s,%s,%s,%s,%s) "+
+		"VALUES(?,?,?,?,?,?,?,?)",
+		db.SuggestionsTableName,
+		db.SuggestionsTableBookID,
+		db.SuggestionsTableTokenTypeID,
+		db.SuggestionsTableSuggestionTypeID,
+		db.SuggestionsTableModernTypeID,
+		db.SuggestionsTableDict,
+		db.SuggestionsTableWeight,
+		db.SuggestionsTableDistance,
+		db.SuggestionsTableTopSuggestion)
+	sid, err := db.NewType(dtb, cand.Suggestion, ids)
+	if err != nil {
+		return fmt.Errorf("cannot insert suggestion: %v", err)
+	}
+	mid, err := db.NewType(dtb, cand.Modern, ids)
+	if err != nil {
+		return fmt.Errorf("cannot insert modern: %v", err)
+	}
+	res, err := db.Exec(dtb, stmt, bid, tid, sid, mid, cand.Dict, cand.Weight, cand.Distance, top)
+	if err != nil {
+		return fmt.Errorf("cannot insert candidate: %v", err)
+	}
+	nid, err := res.LastInsertId()
+	if err != nil {
+		return fmt.Errorf("cannot insert candidate: %v", err)
+	}
+	if err := insertPatterns(dtb, cand.HistPatterns, bid, int(nid), false); err != nil {
+		return fmt.Errorf("cannot insert candidate: %v", err)
+	}
+	if err := insertPatterns(dtb, cand.OCRPatterns, bid, int(nid), true); err != nil {
+		return fmt.Errorf("cannot insert candidate: %v", err)
+	}
+	return nil
+}
 
+func insertPatterns(dtb db.DB, ps []gofiler.Pattern, bid, sid int, ocr bool) error {
+	const stmt = "INSERT INTO errorpatterns " +
+		"(suggestionID,bookID,pattern,ocr) " +
+		"VALUES (?,?,?,?)"
 	for _, p := range ps {
-		if _, err := db.Exec(dtb, stmt, suggID, bookID, p.Left+":"+p.Right, ocr); err != nil {
+		if _, err := db.Exec(dtb, stmt, sid, bid, p.Left+":"+p.Right, ocr); err != nil {
 			return fmt.Errorf("cannot insert pattern: %v", err)
 		}
 	}
@@ -350,18 +404,158 @@ func eachLine(bookID int, f func(db.Chars) error) error {
 	return nil
 }
 
-func tokenize(line db.Chars) []db.Chars {
-	var tokens []db.Chars
-	// log.Debugf("tokenizing line: [%s] %s", line.OCR(), line.Cor())
-	for t, r := line.NextWord(); len(t) > 0 && len(r) > 0; t, r = r.NextWord() {
-		// log.Debugf("word: [%s] %s", t.OCR(), t.Cor())
-		tokens = append(tokens, t)
+func eachWord(line db.Chars, f func(db.Chars) error) error {
+	for t, r := line.NextWord(); len(t) > 0; t, r = r.NextWord() {
+		if err := f(t); err != nil {
+			return err
+		}
 	}
-	return tokens
+	return nil
 }
 
 type logger struct{}
 
 func (logger) Log(msg string) {
 	log.Debug(msg)
+}
+
+func getPatterns() service.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request, d *service.Data) {
+		qs := r.URL.Query()["q"]
+		h := strings.ToLower(r.URL.Query().Get("ocr"))
+		var ocr bool
+		if h == "true" || h == "1" {
+			ocr = true
+		}
+		if len(qs) == 0 {
+			getAllPatterns(w, d, ocr)
+			return
+		}
+		queryPatterns(w, d, qs, ocr)
+	}
+}
+
+func getAllPatterns(w http.ResponseWriter, d *service.Data, ocr bool) {
+	const stmt = "SELECT p.pattern,COUNT(*) " +
+		"FROM errorpatterns p " +
+		"WHERE p.bookID=? AND p.ocr=? " +
+		"GROUP BY p.pattern"
+	rows, err := db.Query(service.Pool(), stmt, d.Project.BookID, ocr)
+	if err != nil {
+		service.ErrorResponse(w, http.StatusInternalServerError,
+			"cannot get patterns: %v", err)
+		return
+	}
+	defer rows.Close()
+	patterns := api.PatternCounts{
+		BookID: d.Project.BookID,
+		OCR:    ocr,
+		Counts: make(map[string]int),
+	}
+	for rows.Next() {
+		var p string
+		var c int
+		if err := rows.Scan(&p, &c); err != nil {
+			service.ErrorResponse(w, http.StatusInternalServerError,
+				"cannot scan pattern: %v", err)
+			return
+		}
+		patterns.Counts[p] = c
+	}
+	service.JSONResponse(w, patterns)
+}
+
+func queryPatterns(w http.ResponseWriter, d *service.Data, qs []string, ocr bool) {
+	const stmt = "SELECT p.pattern,s.id,s.weight,s.distance," +
+		"s.dict,s.topsuggestion,t1.typ,t2.typ,t3.typ " +
+		"FROM errorpatterns p " +
+		"JOIN suggestions s ON p.suggestionID=s.id " +
+		"JOIN types t1 ON s.tokentypid=t1.id " +
+		"JOIN types t2 on s.suggestiontypid=t2.id " +
+		"JOIN types t3 on s.moderntypid=t3.id " +
+		"WHERE p.bookID=? AND p.pattern=? AND p.ocr=?"
+	res := api.Patterns{
+		BookID:   d.Project.BookID,
+		OCR:      ocr,
+		Patterns: make(map[string][]api.Suggestion),
+	}
+	for _, q := range qs {
+		rows, err := db.Query(service.Pool(), stmt, d.Project.BookID, q, ocr)
+		if err != nil {
+			service.ErrorResponse(w, http.StatusInternalServerError,
+				"cannot query pattern %q: %v", q, err)
+			return
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var p string
+			var s api.Suggestion
+			if err := rows.Scan(&p, &s.ID, &s.Weight, &s.Distance, &s.Dict,
+				&s.Top, &s.Token, &s.Suggestion, &s.Modern); err != nil {
+				service.ErrorResponse(w, http.StatusInternalServerError,
+					"cannot query pattern %q: %v", q, err)
+				return
+			}
+			res.Patterns[p] = append(res.Patterns[p], s)
+		}
+	}
+	service.JSONResponse(w, res)
+}
+
+func getSuspiciousWords() service.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request, d *service.Data) {
+		const stmt = "SELECT t.typ " +
+			"FROM suggestions s " +
+			"JOIN types t ON s.tokentypid=t.id " +
+			"WHERE s.bookID=? AND s.topsuggestion=true"
+		rows, err := db.Query(service.Pool(), stmt, d.Project.BookID)
+		if err != nil {
+			service.ErrorResponse(w, http.StatusInternalServerError,
+				"cannot get suspicious words: %v", err)
+			return
+		}
+		defer rows.Close()
+		patterns := api.SuggestionCounts{
+			BookID: d.Project.BookID,
+			Counts: make(map[string]int),
+		}
+		for rows.Next() {
+			var p string
+			if err := rows.Scan(&p); err != nil {
+				service.ErrorResponse(w, http.StatusInternalServerError,
+					"cannot get suspicious words: %v", err)
+				return
+			}
+			patterns.Counts[p] = 1
+		}
+		service.JSONResponse(w, patterns)
+	}
+}
+
+func getAdaptiveTokens() service.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request, d *service.Data) {
+		at := api.AdaptiveTokens{
+			BookID:    d.Project.BookID,
+			ProjectID: d.Project.ProjectID,
+		}
+		seen := make(map[string]bool)
+		var i int
+		eachLine(d.Project.BookID, func(line db.Chars) error {
+			eachWord(line, func(word db.Chars) error {
+				if i < 10 {
+					i++
+				}
+				if word.IsFullyCorrected() {
+					str := strings.ToLower(word.Cor())
+					if !seen[str] {
+						at.AdaptiveTokens = append(at.AdaptiveTokens, str)
+						seen[str] = true
+					}
+				}
+				return nil
+			})
+			return nil
+		})
+		service.JSONResponse(w, at)
+	}
 }

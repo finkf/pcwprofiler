@@ -9,7 +9,6 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"regexp"
 	"strings"
 	"unicode"
 
@@ -18,7 +17,6 @@ import (
 	"github.com/finkf/pcwgo/db"
 	"github.com/finkf/pcwgo/jobs"
 	"github.com/finkf/pcwgo/service"
-	_ "github.com/go-sql-driver/mysql"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -68,9 +66,6 @@ func main() {
 		service.WithLog(service.WithMethods(
 			http.MethodGet, service.WithProject(getProfile()),
 			http.MethodPost, service.WithProject(run()))))
-	http.HandleFunc("/profile/jobs/",
-		service.WithLog(
-			service.WithMethods(http.MethodGet, status())))
 	http.HandleFunc("/profile/patterns/books/",
 		service.WithLog(service.WithMethods(
 			http.MethodGet, service.WithProject(getPatterns()))))
@@ -97,18 +92,6 @@ func getLanguages() service.HandlerFunc {
 			ls.Languages[i] = configs[i].Language
 		}
 		service.JSONResponse(w, ls)
-	}
-}
-
-func status() service.HandlerFunc {
-	re := regexp.MustCompile(`/jobs/(\d+)`)
-	return func(w http.ResponseWriter, r *http.Request, d *service.Data) {
-		var jobID int
-		if err := service.ParseIDs(r.URL.String(), re, &jobID); err != nil {
-			service.ErrorResponse(w, http.StatusNotFound, "invalid job id: %v", err)
-			return
-		}
-		service.JSONResponse(w, jobs.Job(jobID))
 	}
 }
 
@@ -239,9 +222,7 @@ func runProfiler(w http.ResponseWriter, r *http.Request, d *service.Data) {
 			"cannot profile: %v", err)
 		return
 	}
-	service.JSONResponse(w, struct {
-		JobID int `json:"jobId"`
-	}{jobID})
+	service.JSONResponse(w, api.Job{ID: jobID})
 }
 
 func saveProfile(p *db.Project, profile api.Profile) (err error) {

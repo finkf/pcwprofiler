@@ -11,7 +11,3 @@ require (
 	github.com/sirupsen/logrus v1.4.2
 	google.golang.org/appengine v1.6.1 // indirect
 )
-
-replace github.com/finkf/pcwgo/api => ../pcwgo/api
-
-replace github.com/finkf/pcwgo/db => ../pcwgo/db

@@ -118,8 +118,7 @@ func queryProfile(w http.ResponseWriter, p *db.Project, qs []string) {
 		Suggestions: make(map[string][]api.Suggestion),
 	}
 	for _, q := range qs {
-		ql := strings.ToLower(q)
-		if err := selectSuggestions(ql, &ss); err != nil {
+		if err := selectSuggestions(q, &ss); err != nil {
 			service.ErrorResponse(w, http.StatusInternalServerError,
 				"cannot get suggestions: %v", err)
 			return
@@ -130,38 +129,44 @@ func queryProfile(w http.ResponseWriter, p *db.Project, qs []string) {
 
 func selectSuggestions(q string, ss *api.Suggestions) error {
 	const stmt = "SELECT s.id,s.weight,s.distance,s.dict," +
+		"s.histpatterns,s.ocrpatterns," +
 		"s.topsuggestion,t1.typ,t2.typ,t3.typ " +
 		"FROM suggestions s " +
 		"JOIN types t1 ON s.tokentypid=t1.id " +
 		"JOIN types t2 ON s.suggestiontypid=t2.id " +
 		"JOIN types t3 ON s.moderntypid=t3.id " +
 		"WHERE s.bookid=? AND t1.typ=?"
-	rows, err := db.Query(service.Pool(), stmt, ss.BookID, q)
+	rows, err := db.Query(service.Pool(), stmt, ss.BookID, strings.ToLower(q))
 	if err != nil {
 		return err
 	}
 	defer rows.Close()
 	for rows.Next() {
+		var h, o string
 		var s api.Suggestion
-		if err := rows.Scan(&s.ID, &s.Weight, &s.Distance, &s.Dict, &s.Top,
-			&s.Token, &s.Suggestion, &s.Modern); err != nil {
+		if err := rows.Scan(&s.ID, &s.Weight, &s.Distance, &s.Dict, &h, &o,
+			&s.Top, &s.Token, &s.Suggestion, &s.Modern); err != nil {
 			return err
 		}
-		s.Suggestion = sameCasing(q, s.Suggestion)
-		s.Modern = sameCasing(q, s.Modern)
+		s.HistPatterns = strings.Split(h, ",")
+		s.OCRPatterns = strings.Split(o, ",")
+		s.Token = applyCasing(q, s.Token)
+		s.Suggestion = applyCasing(q, s.Suggestion)
+		s.Modern = applyCasing(q, s.Modern)
 		ss.Suggestions[q] = append(ss.Suggestions[q], s)
 	}
 	return nil
 }
 
-func sameCasing(model, str string) string {
+func applyCasing(model, str string) string {
 	wmodel := []rune(model)
 	wstr := []rune(str)
-	for i := range wmodel {
-		if i >= len(wstr) {
-			break
+	var isupper bool
+	for i := range wstr {
+		if i < len(wmodel) {
+			isupper = unicode.IsUpper(wmodel[i])
 		}
-		if unicode.IsUpper(wmodel[i]) {
+		if isupper {
 			wstr[i] = unicode.ToUpper(wstr[i])
 		}
 	}
@@ -188,7 +193,8 @@ func runProfiler(w http.ResponseWriter, r *http.Request, d *service.Data) {
 		return
 	}
 	// start profiling job
-	jobID, err := jobs.Start(context.Background(), d.Project.BookID, func(ctx context.Context) error {
+	desc := jobs.Descriptor{BookID: d.Project.BookID, Name: "profiler"}
+	jobID, err := jobs.Start(context.Background(), desc, func(ctx context.Context) error {
 		var tokens []gofiler.Token
 		err := eachLine(d.Project.BookID, func(line db.Chars) error {
 			return eachWord(line, func(word db.Chars) error {
@@ -251,26 +257,24 @@ func saveProfile(p *db.Project, profile api.Profile) (err error) {
 func insertProfileIntoDB(profile api.Profile) error {
 	t := db.NewTransaction(service.Pool().Begin())
 	t.Do(func(dtb db.DB) error {
-		stmnt := "DELETE FROM suggestions WHERE bookid=?"
-		if _, err := db.Exec(service.Pool(), stmnt, profile.BookID); err != nil {
-			return fmt.Errorf("cannot insert profile: %v", err)
-		}
-		stmnt = "DELETE FROM errorpatterns WHERE bookid=?"
-		if _, err := db.Exec(service.Pool(), stmnt, profile.BookID); err != nil {
-			return fmt.Errorf("cannot insert profile: %v", err)
+		for _, table := range []string{"suggestions", "errorpatterns", "typcounts"} {
+			stmnt := fmt.Sprintf("DELETE FROM %s WHERE bookid=?", table)
+			if _, err := db.Exec(service.Pool(), stmnt, profile.BookID); err != nil {
+				return fmt.Errorf("cannot insert profile: %v", err)
+			}
 		}
 		types := make(map[string]int)
 		for _, interp := range profile.Profile {
 			if len(interp.Candidates) == 0 {
 				continue
 			}
-			tid, err := db.NewType(dtb, interp.OCR, types)
+			tid, err := insertInterpretation(dtb, interp, profile.BookID, types)
 			if err != nil {
 				return fmt.Errorf("cannot insert profile: %v", err)
 			}
 			for i, cand := range interp.Candidates {
-				// skip if no OCR error or if weight too low
-				if cand.Distance == 0 || float64(cand.Weight) <= cutoff {
+				// skip if weight is too low
+				if float64(cand.Weight) <= cutoff {
 					continue
 				}
 				if err := insertCandidate(dtb, cand, profile.BookID,
@@ -279,7 +283,7 @@ func insertProfileIntoDB(profile api.Profile) error {
 				}
 			}
 		}
-		stmnt = "UPDATE books SET statusid=? WHERE bookid=? AND statusid<?"
+		stmnt := "UPDATE books SET statusid=? WHERE bookid=? AND statusid<?"
 		status := db.StatusIDProfiled
 		if _, err := db.Exec(service.Pool(), stmnt, status, profile.BookID, status); err != nil {
 			return fmt.Errorf("cannot insert profile: %v", err)
@@ -289,6 +293,27 @@ func insertProfileIntoDB(profile api.Profile) error {
 	return t.Done()
 }
 
+func insertInterpretation(
+	dtb db.DB,
+	interp gofiler.Interpretation,
+	bid int,
+	ids map[string]int,
+) (int, error) {
+	tid, err := db.NewType(dtb, interp.OCR, ids)
+	if err != nil {
+		return 0, fmt.Errorf("cannot insert interpretation: %v", err)
+	}
+	const stmnt = "INSERT INTO typcounts " +
+		"(typid,bookid,counts) " +
+		"VALUES (?,?,?) " +
+		"ON DUPLICATE KEY UPDATE counts = counts + ?"
+	_, err = db.Exec(dtb, stmnt, tid, bid, interp.N, interp.N)
+	if err != nil {
+		return 0, fmt.Errorf("cannot update counts: %v", err)
+	}
+	return tid, nil
+}
+
 func insertCandidate(
 	dtb db.DB,
 	cand gofiler.Candidate,
@@ -296,8 +321,8 @@ func insertCandidate(
 	ids map[string]int,
 	top bool,
 ) error {
-	stmt := fmt.Sprintf("INSERT INTO %s (%s,%s,%s,%s,%s,%s,%s,%s) "+
-		"VALUES(?,?,?,?,?,?,?,?)",
+	stmt := fmt.Sprintf("INSERT INTO %s (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) "+
+		"VALUES(?,?,?,?,?,?,?,?,?,?)",
 		db.SuggestionsTableName,
 		db.SuggestionsTableBookID,
 		db.SuggestionsTableTokenTypeID,
@@ -306,7 +331,9 @@ func insertCandidate(
 		db.SuggestionsTableDict,
 		db.SuggestionsTableWeight,
 		db.SuggestionsTableDistance,
-		db.SuggestionsTableTopSuggestion)
+		db.SuggestionsTableTopSuggestion,
+		db.SuggestionsTableHistPatterns,
+		db.SuggestionsTableOCRPatterns)
 	sid, err := db.NewType(dtb, cand.Suggestion, ids)
 	if err != nil {
 		return fmt.Errorf("cannot insert suggestion: %v", err)
@@ -315,7 +342,9 @@ func insertCandidate(
 	if err != nil {
 		return fmt.Errorf("cannot insert modern: %v", err)
 	}
-	res, err := db.Exec(dtb, stmt, bid, tid, sid, mid, cand.Dict, cand.Weight, cand.Distance, top)
+	res, err := db.Exec(dtb, stmt, bid, tid, sid, mid,
+		cand.Dict, cand.Weight, cand.Distance, top,
+		patternString(cand.HistPatterns), patternString(cand.OCRPatterns))
 	if err != nil {
 		return fmt.Errorf("cannot insert candidate: %v", err)
 	}
@@ -330,6 +359,14 @@ func insertCandidate(
 		return fmt.Errorf("cannot insert candidate: %v", err)
 	}
 	return nil
+}
+
+func patternString(ps []gofiler.Pattern) string {
+	var strs []string
+	for _, p := range ps {
+		strs = append(strs, fmt.Sprintf("%s:%s:%d", p.Left, p.Right, p.Pos))
+	}
+	return strings.Join(strs, ",")
 }
 
 func insertPatterns(dtb db.DB, ps []gofiler.Pattern, bid, sid int, ocr bool) error {
@@ -448,7 +485,7 @@ func getAllPatterns(w http.ResponseWriter, d *service.Data, ocr bool) {
 
 func queryPatterns(w http.ResponseWriter, d *service.Data, qs []string, ocr bool) {
 	const stmt = "SELECT p.pattern,s.id,s.weight,s.distance," +
-		"s.dict,s.topsuggestion,t1.typ,t2.typ,t3.typ " +
+		"s.dict,s.histpatterns,s.ocrpatterns,s.topsuggestion,t1.typ,t2.typ,t3.typ " +
 		"FROM errorpatterns p " +
 		"JOIN suggestions s ON p.suggestionID=s.id " +
 		"JOIN types t1 ON s.tokentypid=t1.id " +
@@ -469,14 +506,16 @@ func queryPatterns(w http.ResponseWriter, d *service.Data, qs []string, ocr bool
 		}
 		defer rows.Close()
 		for rows.Next() {
-			var p string
+			var p, h, o string
 			var s api.Suggestion
 			if err := rows.Scan(&p, &s.ID, &s.Weight, &s.Distance, &s.Dict,
-				&s.Top, &s.Token, &s.Suggestion, &s.Modern); err != nil {
+				&h, &o, &s.Top, &s.Token, &s.Suggestion, &s.Modern); err != nil {
 				service.ErrorResponse(w, http.StatusInternalServerError,
 					"cannot query pattern %q: %v", q, err)
 				return
 			}
+			s.HistPatterns = strings.Split(h, ",")
+			s.OCRPatterns = strings.Split(o, ",")
 			res.Patterns[p] = append(res.Patterns[p], s)
 		}
 	}
@@ -485,10 +524,11 @@ func queryPatterns(w http.ResponseWriter, d *service.Data, qs []string, ocr bool
 
 func getSuspiciousWords() service.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request, d *service.Data) {
-		const stmt = "SELECT t.typ " +
+		const stmt = "SELECT t.typ,tc.counts " +
 			"FROM suggestions s " +
 			"JOIN types t ON s.tokentypid=t.id " +
-			"WHERE s.bookID=? AND s.topsuggestion=true"
+			"JOIN typcounts tc ON s.tokentypid=tc.typid AND s.bookid=tc.bookid " +
+			"WHERE s.bookID=? AND s.topsuggestion=true AND s.distance > 0"
 		rows, err := db.Query(service.Pool(), stmt, d.Project.BookID)
 		if err != nil {
 			service.ErrorResponse(w, http.StatusInternalServerError,
@@ -497,17 +537,19 @@ func getSuspiciousWords() service.HandlerFunc {
 		}
 		defer rows.Close()
 		patterns := api.SuggestionCounts{
-			BookID: d.Project.BookID,
-			Counts: make(map[string]int),
+			BookID:    d.Project.BookID,
+			ProjectID: d.Project.ProjectID,
+			Counts:    make(map[string]int),
 		}
 		for rows.Next() {
 			var p string
-			if err := rows.Scan(&p); err != nil {
+			var c int
+			if err := rows.Scan(&p, &c); err != nil {
 				service.ErrorResponse(w, http.StatusInternalServerError,
 					"cannot get suspicious words: %v", err)
 				return
 			}
-			patterns.Counts[p] = 1
+			patterns.Counts[p] = c
 		}
 		service.JSONResponse(w, patterns)
 	}

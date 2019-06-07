@@ -1,5 +1,6 @@
 FROM golang:latest
 MAINTAINER Florian Fink
+ENV VERSION='Fri 07 Jun 2019 01:56:35 PM CEST'
 ENV GITURL="https://github.com/cisocrgroup"
 
 RUN apt-get update \

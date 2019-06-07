@@ -24,7 +24,7 @@ var (
 	listen      = ":80"
 	projectDir  = "/project-data"
 	languageDir = "/language-data"
-	profiler    = "/apps/profiler"
+	profbin     = "/apps/profiler"
 	dsn         = ""
 	debug       = false
 	cutoff      = 1e-4
@@ -36,8 +36,8 @@ func init() {
 		projectDir, "set project base dir")
 	flag.StringVar(&languageDir, "language-dir",
 		languageDir, "set profiler's language backend")
-	flag.StringVar(&profiler, "profiler",
-		profiler, "path to profiler executable")
+	flag.StringVar(&profbin, "profiler",
+		profbin, "path to profiler executable")
 	flag.StringVar(&dsn, "dsn", dsn,
 		"set mysql connection DSN (user:pass@proto(host)/dbname)")
 	flag.Float64Var(&cutoff, "cutoff",
@@ -209,7 +209,7 @@ func runProfiler(w http.ResponseWriter, r *http.Request, d *service.Data) {
 			return fmt.Errorf("cannot profile: %v", err)
 		}
 		log.Debugf("profiling %d tokens", len(tokens))
-		tmp, err := gofiler.Run(ctx, profiler, config.Path, tokens, logger{})
+		tmp, err := gofiler.Run(ctx, profbin, config.Path, tokens, logger{})
 		if err != nil {
 			return fmt.Errorf("cannot profile: %v", err)
 		}
